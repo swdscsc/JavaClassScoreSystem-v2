@@ -1,87 +1,74 @@
 package com.swd.score;
 
-import com.swd.score.model.Course;
-import com.swd.score.model.Student;
+import com.swd.score.excel.ExcelExporter;
+import com.swd.score.gui.DemoScreenshot;
+import com.swd.score.gui.LoginFrame;
+import com.swd.score.model.ScoreView;
 import com.swd.score.service.ScoreService;
 
+import javax.swing.SwingUtilities;
+import java.nio.file.Path;
 import java.util.List;
-import java.util.Scanner;
+import java.util.Map;
 
-/** 控制台交互入口。运行后会自动在本地生成 score.db 并建表。 */
-public class Main {
+/**
+ * 入口：
+ *   无参数 / gui                      —— 启动图形界面（登录 -> 角色主界面）
+ *   --export <文件.xlsx>              —— 命令行导出成绩总表 Excel
+ *   --stats                           —— 命令行打印班级/课程统计
+ *   --demo-shot <输出目录>            —— 自动演示并截图（开发用）
+ *   --help                            —— 帮助
+ */
+public final class Main {
+
     public static void main(String[] args) throws Exception {
-        ScoreService svc = new ScoreService();
-        Scanner sc = new Scanner(System.in, "UTF-8");
-        System.out.println("=== 学生成绩管理系统 v2 (SQLite) ===");
-
-        while (true) {
-            System.out.println();
-            System.out.println("1.新增学生  2.新增课程  3.录入成绩  4.学生列表");
-            System.out.println("5.课程列表  6.班级平均分  7.课程平均分  8.绩点排名");
-            System.out.println("9.导出CSV   0.退出");
-            System.out.print("请选择> ");
-            String choice = sc.nextLine().trim();
-
-            try {
-                switch (choice) {
-                    case "1" -> {
-                        System.out.print("学号> "); String no = sc.nextLine().trim();
-                        System.out.print("姓名> "); String name = sc.nextLine().trim();
-                        System.out.print("性别> "); String gender = sc.nextLine().trim();
-                        System.out.print("班级> "); String cls = sc.nextLine().trim();
-                        svc.addStudent(new Student(no, name, gender, cls));
-                        System.out.println("已添加学生: " + name);
-                    }
-                    case "2" -> {
-                        System.out.print("课程代码> "); String code = sc.nextLine().trim();
-                        System.out.print("课程名> "); String cname = sc.nextLine().trim();
-                        System.out.print("学分> "); double credit = Double.parseDouble(sc.nextLine().trim());
-                        svc.addCourse(new Course(code, cname, credit));
-                        System.out.println("已添加课程: " + cname);
-                    }
-                    case "3" -> {
-                        System.out.print("学号> "); String no = sc.nextLine().trim();
-                        System.out.print("课程代码> "); String code = sc.nextLine().trim();
-                        System.out.print("成绩> "); double v = Double.parseDouble(sc.nextLine().trim());
-                        System.out.println(svc.recordScore(no, code, v));
-                    }
-                    case "4" -> {
-                        for (Student s : svc.listStudents())
-                            System.out.printf("%d  %s  %s  %s  %s%n",
-                                    s.getId(), s.getStudentNo(), s.getName(), s.getGender(), s.getClassName());
-                    }
-                    case "5" -> {
-                        for (Course c : svc.listCourses())
-                            System.out.printf("%d  %s  %s  %.1f学分%n",
-                                    c.getId(), c.getCode(), c.getName(), c.getCredit());
-                    }
-                    case "6" -> {
-                        System.out.print("班级名> "); String cls = sc.nextLine().trim();
-                        System.out.printf("班级平均分: %.2f%n", svc.classAverage(cls));
-                    }
-                    case "7" -> {
-                        System.out.print("课程代码> "); String code = sc.nextLine().trim();
-                        double a = svc.courseAverage(code);
-                        System.out.println(a < 0 ? "未找到课程" : String.format("课程平均分: %.2f", a));
-                    }
-                    case "8" -> {
-                        List<ScoreService.RankEntry> ranks = svc.ranking();
-                        int i = 1;
-                        for (ScoreService.RankEntry e : ranks)
-                            System.out.printf("%d. %s  GPA=%.2f%n", i++, e.name, e.gpa);
-                    }
-                    case "9" -> {
-                        System.out.print("导出路径(默认 score.csv)> ");
-                        String p = sc.nextLine().trim();
-                        svc.exportCsv(p.isEmpty() ? "score.csv" : p);
-                        System.out.println("已导出 " + (p.isEmpty() ? "score.csv" : p));
-                    }
-                    case "0" -> { System.out.println("再见"); return; }
-                    default -> System.out.println("无效输入");
-                }
-            } catch (Exception e) {
-                System.out.println("操作失败: " + e.getMessage());
+        if (args.length == 0 || "gui".equals(args[0])) {
+            SwingUtilities.invokeLater(() -> new LoginFrame().setVisible(true));
+            return;
+        }
+        switch (args[0]) {
+            case "--export" -> {
+                requireDb();
+                String file = args.length > 1 ? args[1] : "成绩总表.xlsx";
+                ScoreService svc = new ScoreService();
+                List<ScoreView> rows = svc.allRows();
+                new ExcelExporter().export(rows, svc.classAverages(), Path.of(file));
+                System.out.println("已导出 " + rows.size() + " 条成绩 -> " + Path.of(file).toAbsolutePath());
             }
+            case "--stats" -> {
+                requireDb();
+                ScoreService svc = new ScoreService();
+                List<ScoreView> rows = svc.allRows();
+                System.out.println("成绩条数: " + rows.size());
+                System.out.println("-- 班级平均分 --");
+                svc.classAverages().forEach((k, v) -> System.out.printf("  %s: %.2f%n", k, v));
+                System.out.println("-- 课程平均分 --");
+                svc.courseAverages().forEach((k, v) -> System.out.printf("  %s: %.2f%n", k, v));
+                Map<String, Double> byStu = ScoreService.averageByStudent(rows);
+                System.out.println("-- 学生平均分排名 --");
+                byStu.entrySet().stream()
+                        .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+                        .forEach(e -> System.out.printf("  %-1s: %.2f (第 %d 名)%n",
+                                e.getKey(), e.getValue(), ScoreService.rankOf(rows, e.getKey())));
+            }
+            case "--demo-shot" -> DemoScreenshot.run(
+                    args.length > 1 ? args[1] : "docs/screenshots");
+            case "--help" -> System.out.println("""
+                    用法:
+                      java com.swd.score.Main            # 启动图形界面
+                      java com.swd.score.Main --export 成绩总表.xlsx
+                      java com.swd.score.Main --stats
+                      java com.swd.score.Main --demo-shot docs/screenshots
+                    """);
+            default -> System.err.println("未知参数: " + args[0] + "（--help 查看用法）");
+        }
+    }
+
+    private static void requireDb() {
+        if (!com.swd.score.dao.Database.isConfigured()) {
+            System.err.println("数据库未配置：请在工作目录放置 db.local.properties（含 db.url/db.user/db.password），"
+                    + "或设置环境变量 DB_USER / DB_PASS。建库脚本见 src/main/resources/schema_mysql.sql");
+            System.exit(2);
         }
     }
 }
