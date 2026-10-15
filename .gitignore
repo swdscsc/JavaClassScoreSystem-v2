@@ -1,7 +1,15 @@
+# 本地数据库口令（绝不入库）
+db.local.properties
+
+# 构建产物
 target/
+out/
 *.class
-*.db
-*.db-journal
-*.iml
+
+# 导出的 Excel 演示文件
+*.xlsx
+
+# IDE
 .idea/
+*.iml
 .vscode/
