@@ -1,90 +1,119 @@
 package com.swd.score.dao;
 
-import java.sql.*;
-import java.util.ArrayList;
-import java.util.List;
+import com.swd.score.model.ScoreView;
 
-/** 成绩数据访问。提供录入（存在则更新）、联表查询与课程平均分。 */
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/** 成绩数据访问：明细查询、班级/课程统计、成绩写入（MySQL JOIN 实现）。 */
 public class ScoreDao {
 
-    /** 联表展示用的轻量视图对象。 */
-    public static class ScoreView {
-        public String studentNo;
-        public String name;
-        public String courseName;
-        public double value;
+    private static final String JOIN_SQL =
+            "SELECT s.stu_no, s.stu_name, s.clazz, c.name AS course, sc.score, sc.exam_date " +
+            "FROM scores sc " +
+            "JOIN students s ON s.id = sc.stu_id " +
+            "JOIN courses  c ON c.id = sc.course_id ";
+
+    /** 全部成绩明细。 */
+    public List<ScoreView> findAll() throws SQLException {
+        return query(JOIN_SQL + "ORDER BY s.clazz, s.stu_no, c.id");
     }
 
-    /** 录入或更新（同一学生同一课程只保留一条记录）。 */
-    public void upsert(int studentId, int courseId, double value) throws Exception {
-        try (Connection c = Database.getConnection()) {
-            try (PreparedStatement ps = c.prepareStatement(
-                    "UPDATE score SET value=? WHERE student_id=? AND course_id=?")) {
-                ps.setDouble(1, value);
-                ps.setInt(2, studentId);
-                ps.setInt(3, courseId);
-                if (ps.executeUpdate() == 0) {
-                    try (PreparedStatement pi = c.prepareStatement(
-                            "INSERT INTO score(student_id,course_id,value) VALUES(?,?,?)")) {
-                        pi.setInt(1, studentId);
-                        pi.setInt(2, courseId);
-                        pi.setDouble(3, value);
-                        pi.executeUpdate();
-                    }
-                }
+    /** 某学号学生的成绩明细。 */
+    public List<ScoreView> findByStudentNo(String stuNo) throws SQLException {
+        return query(JOIN_SQL + "WHERE s.stu_no = ? ORDER BY c.id", stuNo);
+    }
+
+    /** 班级 -> 平均分。 */
+    public Map<String, Double> classAverages() throws SQLException {
+        return avgBy("s.clazz");
+    }
+
+    /** 课程 -> 平均分。 */
+    public Map<String, Double> courseAverages() throws SQLException {
+        return avgBy("c.name");
+    }
+
+    /** 教师录入/更新一条成绩（同一学生同一课程只保留最新）。 */
+    public boolean upsert(String stuNo, String courseName, double value, String examDate)
+            throws SQLException {
+        String ensureStudent =
+                "INSERT IGNORE INTO students (stu_no, stu_name, clazz) VALUES (?, ?, '待分配')";
+        String ensureCourse =
+                "INSERT IGNORE INTO courses (name) VALUES (?)";
+        String upsertScore =
+                "INSERT INTO scores (stu_id, course_id, score, exam_date) " +
+                "SELECT s.id, c.id, ?, ? FROM students s, courses c " +
+                "WHERE s.stu_no = ? AND c.name = ? " +
+                "ON DUPLICATE KEY UPDATE score = VALUES(score), exam_date = VALUES(exam_date)";
+        try (Connection c = Database.get()) {
+            c.setAutoCommit(false);
+            try (PreparedStatement p1 = c.prepareStatement(ensureStudent);
+                 PreparedStatement p2 = c.prepareStatement(ensureCourse);
+                 PreparedStatement p3 = c.prepareStatement(upsertScore)) {
+                p1.setString(1, stuNo);
+                p1.setString(2, "新增学生");
+                p1.executeUpdate();
+                p2.setString(1, courseName);
+                p2.executeUpdate();
+                p3.setDouble(1, value);
+                p3.setString(2, examDate);
+                p3.setString(3, stuNo);
+                p3.setString(4, courseName);
+                int n = p3.executeUpdate();
+                c.commit();
+                return n > 0;
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            } finally {
+                c.setAutoCommit(true);
             }
         }
     }
 
-    /** 学生-课程-成绩联表结果，用于导出与展示。 */
-    public List<ScoreView> allWithNames() throws Exception {
-        List<ScoreView> list = new ArrayList<>();
-        String sql = "SELECT s.student_no, s.name, c.name AS course, sc.value "
-                   + "FROM score sc "
-                   + "JOIN student s ON s.id=sc.student_id "
-                   + "JOIN course c ON c.id=sc.course_id "
-                   + "ORDER BY s.id, c.id";
-        try (Connection c = Database.getConnection();
-             Statement st = c.createStatement();
-             ResultSet rs = st.executeQuery(sql)) {
-            while (rs.next()) {
-                ScoreView v = new ScoreView();
-                v.studentNo = rs.getString("student_no");
-                v.name = rs.getString("name");
-                v.courseName = rs.getString("course");
-                v.value = rs.getDouble("value");
-                list.add(v);
-            }
-        }
-        return list;
-    }
+    // ---------- 内部 ----------
 
-    /** 某课程的全体平均分。 */
-    public double avgByCourse(int courseId) throws Exception {
-        try (Connection c = Database.getConnection();
-             PreparedStatement ps = c.prepareStatement(
-                 "SELECT AVG(value) FROM score WHERE course_id=?")) {
-            ps.setInt(1, courseId);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getDouble(1) : 0.0;
-            }
-        }
-    }
-
-    /** 某学生的 成绩-学分 明细，用于 GPA 计算。 */
-    public List<double[]> valuesWithCredit(int studentId) throws Exception {
-        List<double[]> rows = new ArrayList<>();
-        String sql = "SELECT sc.value, c.credit FROM score sc "
-                   + "JOIN course c ON c.id=sc.course_id WHERE sc.student_id=?";
-        try (Connection c = Database.getConnection();
+    private List<ScoreView> query(String sql, Object... args) throws SQLException {
+        List<ScoreView> rows = new ArrayList<>();
+        try (Connection c = Database.get();
              PreparedStatement ps = c.prepareStatement(sql)) {
-            ps.setInt(1, studentId);
+            for (int i = 0; i < args.length; i++) {
+                ps.setObject(i + 1, args[i]);
+            }
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    rows.add(new double[]{rs.getDouble("value"), rs.getDouble("credit")});
+                    rows.add(new ScoreView(
+                            rs.getString("stu_no"),
+                            rs.getString("stu_name"),
+                            rs.getString("clazz"),
+                            rs.getString("course"),
+                            rs.getDouble("score"),
+                            String.valueOf(rs.getDate("exam_date"))));
                 }
             }
         }
         return rows;
+    }
+
+    private Map<String, Double> avgBy(String groupCol) throws SQLException {
+        Map<String, Double> out = new LinkedHashMap<>();
+        String sql = "SELECT " + groupCol + " AS g, ROUND(AVG(sc.score), 2) AS avg_score " +
+                     "FROM scores sc JOIN students s ON s.id = sc.stu_id " +
+                     "JOIN courses c ON c.id = sc.course_id GROUP BY " + groupCol + " ORDER BY g";
+        try (Connection c = Database.get();
+             PreparedStatement ps = c.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                out.put(rs.getString("g"), rs.getDouble("avg_score"));
+            }
+        }
+        return out;
     }
 }
