@@ -1,127 +1,136 @@
 package com.swd.score.service;
 
-import com.swd.score.dao.*;
-import com.swd.score.model.Course;
-import com.swd.score.model.Student;
+import com.swd.score.dao.ScoreDao;
+import com.swd.score.dao.UserDao;
+import com.swd.score.model.ScoreView;
+import com.swd.score.model.User;
 
-import java.io.FileOutputStream;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Comparator;
+import java.security.MessageDigest;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * 业务逻辑层：编排 DAO，提供学生/课程/成绩的增删查与统计、GPA、排名、导出。
- * UI（Main）与测试都只依赖本层，便于替换为图形界面或 Web 接口。
+ * 业务层：登录鉴权、成绩查询/录入、统计（平均分 / 排名 / GPA）。
+ * 统计函数均为纯函数（静态方法），便于单元测试。
  */
 public class ScoreService {
-    private final StudentDao studentDao = new StudentDao();
-    private final CourseDao courseDao = new CourseDao();
+
+    private final UserDao userDao = new UserDao();
     private final ScoreDao scoreDao = new ScoreDao();
 
-    // ---- 写操作 ----
-    public void addStudent(Student s) throws Exception { studentDao.insert(s); }
-    public void addCourse(Course c) throws Exception { courseDao.insert(c); }
+    // ---------- 登录 ----------
 
-    /** 按学号 + 课程代码录入成绩（解析不到则返回错误信息）。 */
-    public String recordScore(String studentNo, String courseCode, double value) throws Exception {
-        Student s = studentDao.findByNo(studentNo);
-        if (s == null) return "未找到学号: " + studentNo;
-        Course c = courseDao.findByCode(courseCode);
-        if (c == null) return "未找到课程代码: " + courseCode;
-        scoreDao.upsert(s.getId(), c.getId(), value);
-        return "已录入 " + s.getName() + " 的《" + c.getName() + "》成绩: " + value;
-    }
-
-    // ---- 读 / 统计 ----
-    public List<Student> listStudents() throws Exception { return studentDao.findAll(); }
-    public List<Course> listCourses() throws Exception { return courseDao.findAll(); }
-
-    /** 班级平均分（按学生 class_name 聚合成绩）。 */
-    public double classAverage(String className) throws Exception {
-        String sql = "SELECT AVG(sc.value) FROM score sc "
-                   + "JOIN student s ON s.id=sc.student_id WHERE s.class_name=?";
-        try (var c = Database.getConnection();
-             var ps = c.prepareStatement(sql)) {
-            ps.setString(1, className);
-            try (var rs = ps.executeQuery()) {
-                return rs.next() ? rs.getDouble(1) : 0.0;
-            }
+    /** 校验用户名/口令；成功返回 User，失败返回 null。口令以 SHA-256 摘要比对。 */
+    public User login(String username, String password) {
+        if (username == null || username.isBlank()
+                || password == null || password.isBlank()) {
+            return null;
+        }
+        try {
+            return userDao.findByUsername(username.trim())
+                    .filter(u -> u.getPasswordHash().equalsIgnoreCase(sha256(password)))
+                    .orElse(null);
+        } catch (Exception e) {
+            System.err.println("[login] " + e.getMessage());
+            return null;
         }
     }
 
-    public double courseAverage(String courseCode) throws Exception {
-        Course c = courseDao.findByCode(courseCode);
-        if (c == null) return -1;
-        return scoreDao.avgByCourse(c.getId());
+    // ---------- 查询 ----------
+
+    public List<ScoreView> allRows() {
+        try { return scoreDao.findAll(); }
+        catch (Exception e) { throw new IllegalStateException("查询失败: " + e.getMessage(), e); }
     }
 
-    /** 将百分制分数映射为 4.0 绩点（常用分段线性近似）。 */
-    public static double scoreToPoint(double score) {
-        if (score >= 90) return 4.0;
-        if (score >= 85) return 3.7;
-        if (score >= 82) return 3.3;
-        if (score >= 78) return 3.0;
-        if (score >= 75) return 2.7;
-        if (score >= 72) return 2.3;
-        if (score >= 68) return 2.0;
-        if (score >= 64) return 1.5;
-        if (score >= 60) return 1.0;
+    public List<ScoreView> rowsForStudent(String stuNo) {
+        try { return scoreDao.findByStudentNo(stuNo); }
+        catch (Exception e) { throw new IllegalStateException("查询失败: " + e.getMessage(), e); }
+    }
+
+    public Map<String, Double> classAverages() {
+        try { return scoreDao.classAverages(); }
+        catch (Exception e) { throw new IllegalStateException("统计失败: " + e.getMessage(), e); }
+    }
+
+    public Map<String, Double> courseAverages() {
+        try { return scoreDao.courseAverages(); }
+        catch (Exception e) { throw new IllegalStateException("统计失败: " + e.getMessage(), e); }
+    }
+
+    /** 教师录入成绩；学生不存在时自动建档。 */
+    public boolean addScore(String stuNo, String course, double value, String examDate) {
+        if (stuNo == null || stuNo.isBlank() || course == null || course.isBlank()) {
+            return false;
+        }
+        try { return scoreDao.upsert(stuNo.trim(), course.trim(), value, examDate); }
+        catch (Exception e) { throw new IllegalStateException("录入失败: " + e.getMessage(), e); }
+    }
+
+    // ---------- 统计（纯函数，可单测） ----------
+
+    /** 一组成绩的平均分；空集合返回 0.0。 */
+    public static double average(List<Double> values) {
+        if (values == null || values.isEmpty()) return 0.0;
+        return values.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+    }
+
+    /** 按学生汇总：学号 -> 平均分（保持首见顺序）。 */
+    public static Map<String, Double> averageByStudent(List<ScoreView> rows) {
+        Map<String, List<Double>> grouped = new LinkedHashMap<>();
+        for (ScoreView r : rows) {
+            grouped.computeIfAbsent(r.getStuNo(), k -> new java.util.ArrayList<>()).add(r.getScore());
+        }
+        Map<String, Double> out = new LinkedHashMap<>();
+        grouped.forEach((k, v) -> out.put(k, round2(average(v))));
+        return out;
+    }
+
+    /** 某学号在成绩明细中的平均分排名（1 = 最高）。 */
+    public static int rankOf(List<ScoreView> rows, String stuNo) {
+        Map<String, Double> avg = averageByStudent(rows);
+        double mine = avg.getOrDefault(stuNo, 0.0);
+        int rank = 1;
+        for (Map.Entry<String, Double> e : avg.entrySet()) {
+            if (!e.getKey().equals(stuNo) && e.getValue() > mine) rank++;
+        }
+        return rank;
+    }
+
+    /** 常见 4.0 分段 GPA（百分制 -> 4.0 制，纯函数）。 */
+    public static double gpa4(List<Double> values) {
+        if (values == null || values.isEmpty()) return 0.0;
+        double sum = 0;
+        for (double v : values) sum += toGpaPoint(v);
+        return round2(sum / values.size());
+    }
+
+    static double toGpaPoint(double v) {
+        if (v >= 90) return 4.0;
+        if (v >= 85) return 3.7;
+        if (v >= 82) return 3.3;
+        if (v >= 78) return 3.0;
+        if (v >= 75) return 2.7;
+        if (v >= 72) return 2.3;
+        if (v >= 68) return 2.0;
+        if (v >= 64) return 1.5;
+        if (v >= 60) return 1.0;
         return 0.0;
     }
 
-    /** 学分加权平均绩点（4.0 制）。 */
-    public double gpa(String studentNo) throws Exception {
-        Student s = studentDao.findByNo(studentNo);
-        if (s == null) return -1;
-        List<double[]> rows = scoreDao.valuesWithCredit(s.getId());
-        double ptSum = 0, crSum = 0;
-        for (double[] r : rows) {
-            double point = scoreToPoint(r[0]);
-            double credit = r[1];
-            ptSum += point * credit;
-            crSum += credit;
-        }
-        return crSum > 0 ? ptSum / crSum : 0.0;
-    }
+    static double round2(double v) { return Math.round(v * 100.0) / 100.0; }
 
-    /** 排名条目：学生姓名 + 4.0 制 GPA。 */
-    public static class RankEntry {
-        public String name;
-        public double gpa;
-    }
-
-    /** 对所有已录入成绩的学生按 GPA 降序排名。 */
-    public List<RankEntry> ranking() throws Exception {
-        List<RankEntry> result = new ArrayList<>();
-        for (Student s : studentDao.findAll()) {
-            List<double[]> rows = scoreDao.valuesWithCredit(s.getId());
-            if (rows.isEmpty()) continue;
-            double ptSum = 0, crSum = 0;
-            for (double[] r : rows) {
-                ptSum += scoreToPoint(r[0]) * r[1];
-                crSum += r[1];
-            }
-            RankEntry e = new RankEntry();
-            e.name = s.getName();
-            e.gpa = crSum > 0 ? ptSum / crSum : 0.0;
-            result.add(e);
-        }
-        result.sort(Comparator.comparingDouble((RankEntry e) -> e.gpa).reversed());
-        return result;
-    }
-
-    /** 将全部成绩明细导出为 UTF-8 CSV。 */
-    public void exportCsv(String path) throws Exception {
-        List<ScoreDao.ScoreView> rows = scoreDao.allWithNames();
-        try (PrintWriter w = new PrintWriter(
-                new OutputStreamWriter(new FileOutputStream(path), StandardCharsets.UTF_8))) {
-            w.println("student_no,name,course,value");
-            for (ScoreDao.ScoreView v : rows) {
-                w.println(v.studentNo + "," + v.name + "," + v.courseName + "," + v.value);
-            }
+    static String sha256(String text) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(text.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(64);
+            for (byte b : d) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
         }
     }
 }
