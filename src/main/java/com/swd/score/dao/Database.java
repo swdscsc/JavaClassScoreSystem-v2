@@ -1,52 +1,67 @@
 package com.swd.score.dao;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
-import java.sql.Statement;
+import java.sql.SQLException;
+import java.util.Properties;
 
-/** SQLite 连接管理 + 建表。单例连接，首次使用时自动初始化 schema。 */
+/**
+ * 数据库连接管理（MySQL）。
+ *
+ * 配置优先级：
+ * 1. 工作目录下的 db.local.properties（含真实口令，已被 .gitignore 排除，不入库）；
+ * 2. classpath 内 resources/db.properties（提交到仓库的占位模板，真实口令用环境变量 DB_USER / DB_PASS 注入）。
+ *
+ * 建库脚本：src/main/resources/schema_mysql.sql
+ *   mysql -uroot -p < schema_mysql.sql
+ */
 public final class Database {
-    private static final String URL = "jdbc:sqlite:score.db";
-    private static Connection conn;
+
+    private static final Properties CFG = load();
 
     private Database() {}
 
-    public static Connection getConnection() throws Exception {
-        if (conn == null || conn.isClosed()) {
-            Class.forName("org.sqlite.JDBC");
-            conn = DriverManager.getConnection(URL);
-            initSchema();
+    private static Properties load() {
+        Properties p = new Properties();
+        // 1) 本地真实配置（不入库）
+        Path local = Path.of("db.local.properties");
+        if (Files.exists(local)) {
+            try (InputStream in = Files.newInputStream(local)) {
+                p.load(in);
+                return p;
+            } catch (IOException ignored) { }
         }
-        return conn;
+        // 2) 仓库模板 + 环境变量
+        try (InputStream in = Database.class.getResourceAsStream("/db.properties")) {
+            if (in != null) {
+                p.load(in);
+            }
+        } catch (IOException ignored) { }
+        String user = System.getenv("DB_USER");
+        String pass = System.getenv("DB_PASS");
+        if (user != null && !user.isBlank()) {
+            p.setProperty("db.user", user);
+            p.setProperty("db.password", pass == null ? "" : pass);
+        }
+        return p;
     }
 
-    private static void initSchema() throws Exception {
-        try (Statement st = conn.createStatement()) {
-            st.executeUpdate("""
-                CREATE TABLE IF NOT EXISTS student (
-                  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                  student_no  TEXT    UNIQUE NOT NULL,
-                  name        TEXT    NOT NULL,
-                  gender      TEXT,
-                  class_name  TEXT
-                )""");
-            st.executeUpdate("""
-                CREATE TABLE IF NOT EXISTS course (
-                  id     INTEGER PRIMARY KEY AUTOINCREMENT,
-                  code   TEXT    UNIQUE NOT NULL,
-                  name   TEXT    NOT NULL,
-                  credit REAL    NOT NULL DEFAULT 0
-                )""");
-            st.executeUpdate("""
-                CREATE TABLE IF NOT EXISTS score (
-                  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                  student_id INTEGER NOT NULL,
-                  course_id  INTEGER NOT NULL,
-                  value      REAL    NOT NULL,
-                  UNIQUE(student_id, course_id),
-                  FOREIGN KEY(student_id) REFERENCES student(id) ON DELETE CASCADE,
-                  FOREIGN KEY(course_id)  REFERENCES course(id)  ON DELETE CASCADE
-                )""");
-        }
+    public static Connection get() throws SQLException {
+        return DriverManager.getConnection(
+                CFG.getProperty("db.url", "jdbc:mysql://localhost:3306/score_system"
+                        + "?useSSL=false&allowPublicKeyRetrieval=true"
+                        + "&serverTimezone=Asia/Shanghai&characterEncoding=utf8"),
+                CFG.getProperty("db.user", "root"),
+                CFG.getProperty("db.password", ""));
+    }
+
+    /** 演示环境口令是否已配置。 */
+    public static boolean isConfigured() {
+        String u = CFG.getProperty("db.user", "");
+        return !u.isBlank() && !u.equals("CHANGE_ME");
     }
 }
